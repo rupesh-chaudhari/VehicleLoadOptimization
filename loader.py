@@ -2,18 +2,20 @@
 import html
 import pandas as pd
 from planogram import top_view, side_view, colour
+from optimizer import stability_report
 
 
 def loading_steps(blocks: pd.DataFrame) -> pd.DataFrame:
     rows = []
-    for n, d in enumerate(blocks.sort_values("From (mm)").to_dict("records"), start=1):
-        cpr = int(d["Cases per row"]); full, rem = divmod(int(d["Cases"]), cpr)
+    for n, d in enumerate(blocks.sort_values(["From (mm)", "Tier"] if "Tier" in blocks else "From (mm)").to_dict("records"), start=1):
+        cpr = int(d["Cases per row"])
         orient = "Long side ALONG the truck" if d["Orientation"] == "Lengthwise" else "Long side ACROSS the truck"
-        last = "" if rem == 0 else f"Last row: {rem} cases in {-(-rem // int(d['Layers']))} stacks (start from left wall)"
+        last = d.get("Note") or ""
         rows.append({"Step": n, "Zone from cab (m)": f"{d['From (mm)'] / 1000:.2f} – {d['To (mm)'] / 1000:.2f}",
                      "Drop / stop": (f"Stop {d['Stop']} · {d['Drop']}" if d.get("Stop") else (d.get("Drop") or "-")),
                      "Category": d["Category"], "Case position": orient,
-                     "Pattern": f"{int(d['Lanes'])} across × {int(d['Layers'])} high = {cpr} per row",
+                     "Pattern": f"{int(d['Lanes'])} across × {int(d['Layers'])} high = {cpr} per row"
+                                + (f" (centre; {int(d['Side gap each side (mm)'])} mm gap each side)" if d.get("Side gap each side (mm)", 0) > 40 else ""),
                      "Rows": int(d["Rows"]), "Cases": int(d["Cases"]), "Note": last, "_key": d["Stop"] if d.get("Stop") else d["Line"]})
     return pd.DataFrame(rows)
 
@@ -26,7 +28,14 @@ def loader_html(plan: dict, title: str, by: str = "Line", names: dict | None = N
         + "".join(f"<td>{html.escape(str(r[c]))}</td>" for c in ["Zone from cab (m)", "Drop / stop", "Category", "Case position", "Pattern", "Rows", "Cases", "Note"])
         + "</tr>" for _, r in steps.iterrows())
     top = top_view(plan["stacks"], plan["blocks"], t, by, names).to_html(full_html=False, include_plotlyjs=True)  # embedded: prints offline
-    side = side_view(plan["stacks"], t, by, names).to_html(full_html=False, include_plotlyjs=False)
+    side = side_view(plan["stacks"], t, by, names, plan["blocks"]).to_html(full_html=False, include_plotlyjs=False)
+    rep = stability_report(plan)
+    acts = "".join(f"<li>{html.escape(a)}</li>" for a in rep.get("actions", [])) or "<li>No extra securing needed beyond standard practice.</li>"
+    stab = (f"<h3>Securing the load</h3><p>Load height {rep.get('height_min', 0):.0f}–{rep.get('height_max', 0):.0f} mm · "
+            f"void at doors {rep.get('void_mm', 0) / 1000:.2f} m · side gap ≤ {rep.get('side_gap_mm', 0):.0f} mm each side · "
+            f"centre of gravity {rep.get('cg_pct', 0):.0%} of body length</p><ul>{acts}"
+            "<li>Every row is full width from wall to wall; part layers only on top. Do not leave gaps on the floor.</li>"
+            "<li>One level load height cab to doors - do not stack any block higher than shown, even if space is left.</li><li>Fix a separator sheet + load bar at every dashed separator line before loading the next stop.</li></ul>")
     tot = plan["table"]
     lines = "".join(f"<tr><td>{html.escape(str(r['Category']))}</td><td>{html.escape(str(r['Drop'] or '-'))}</td>"
                     f"<td style='text-align:right'>{int(r['Loaded cases']):,}</td></tr>" for _, r in tot[tot["Loaded cases"] > 0].iterrows())
@@ -39,7 +48,7 @@ th{{background:#D9E1F2;text-align:left}} .box{{display:flex;gap:28px}} .sign td{
 <b>{k['cases']:,} cases</b> · {k['weight_kg'] / 1000:.2f} MT ({k['payload_util']:.0%} payload) · floor {k['floor_util']:.0%}</div>
 <h3>Load in this order — start at the cab end, finish at the doors</h3>
 <table><tr><th>Step</th><th>Zone from cab (m)</th><th>Drop / stop</th><th>Category</th><th>Case position</th><th>Pattern</th><th>Rows</th><th>Cases</th><th>Note</th></tr>{trs}</table>
-<div class="pb"></div>{top}{side}
+{stab}<div class="pb"></div>{top}{side}
 <div class="box"><div style="flex:1"><h3>Pick list</h3><table><tr><th>Category</th><th>Drop</th><th>Cases</th></tr>{lines}</table></div>
 <div style="flex:1"><h3>Sign-off</h3><table class="sign"><tr><td>Loader</td><td></td></tr><tr><td>Supervisor</td><td></td></tr>
 <tr><td>Vehicle no.</td><td></td></tr><tr><td>Seal no.</td><td></td></tr><tr><td>Time</td><td></td></tr></table></div></div>

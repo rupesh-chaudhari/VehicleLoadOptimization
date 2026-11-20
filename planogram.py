@@ -19,6 +19,26 @@ def _groups(stacks: pd.DataFrame, by: str, names: dict | None = None):
         yield key, label, g
 
 
+def _void(fig, stacks, L, top):
+    if stacks.empty:
+        return
+    used = float((stacks["x"] + stacks["dx"]).max())
+    if L - used > 100:
+        fig.add_shape(type="rect", x0=used, x1=L, y0=0, y1=top, fillcolor="rgba(150,150,150,0.25)", line=dict(color="#999", dash="dot"))
+        fig.add_shape(type="line", x0=used + 30, x1=used + 30, y0=0, y1=top, line=dict(color="#C00000", width=4))
+        fig.add_annotation(x=(used + L) / 2, y=top / 2, text=f"Void {(L - used) / 1000:.2f} m<br>load-lock bar /<br>dunnage bag" if L - used > 600
+                           else "Load-lock<br>bar", showarrow=False, font=dict(size=9, color="#C00000"))
+
+
+def _separators(fig, blocks, top):
+    if blocks is None or blocks.empty or "Separator after" not in blocks:
+        return
+    for _, b in blocks[blocks["Separator after"].astype(bool)].iterrows():
+        x = b["To (mm)"]
+        fig.add_shape(type="line", x0=x, x1=x, y0=-40, y1=top + 40, line=dict(color="#000", width=3, dash="dash"))
+        fig.add_annotation(x=x, y=top + 120, text="separator", showarrow=False, font=dict(size=9))
+
+
 def _frame(fig, L, W_or_H, title, ylab):
     fig.add_shape(type="rect", x0=0, y0=0, x1=L, y1=W_or_H, line=dict(color="#333", width=2))
     fig.update_layout(title=title, height=330, margin=dict(l=40, r=20, t=50, b=40), plot_bgcolor="white",
@@ -29,37 +49,58 @@ def _frame(fig, L, W_or_H, title, ylab):
 
 def top_view(stacks: pd.DataFrame, blocks: pd.DataFrame, truck, by: str = "Line", names: dict | None = None) -> go.Figure:
     fig = go.Figure()
-    for line, label, g in _groups(stacks, by, names):
+    tier = stacks["tier"] if "tier" in stacks else pd.Series(0, index=stacks.index)
+    for line, label, g in _groups(stacks[tier == 0], by, names):
         xs, ys, text = [], [], []
         for _, s in g.iterrows():
             xs += [s.x, s.x + s.dx, s.x + s.dx, s.x, s.x, None]
             ys += [s.y, s.y, s.y + s.dy, s.y + s.dy, s.y, None]
         fig.add_trace(go.Scatter(x=xs, y=ys, fill="toself", mode="lines", line=dict(color="white", width=1),
                                  fillcolor=colour(line), name=label, hoverinfo="name"))
+    for line, label, g in _groups(stacks[tier == 1], by, names):      # top tier: hatched, dark outline
+        xs, ys = [], []
+        for _, s in g.iterrows():
+            xs += [s.x, s.x + s.dx, s.x + s.dx, s.x, s.x, None]
+            ys += [s.y, s.y, s.y + s.dy, s.y + s.dy, s.y, None]
+        fig.add_trace(go.Scatter(x=xs, y=ys, fill="toself", mode="lines", line=dict(color="#222", width=1),
+                                 fillcolor=colour(line), fillpattern=dict(shape="/", fgcolor="rgba(0,0,0,0.35)"),
+                                 name=f"{label} (top tier)", hoverinfo="name", showlegend=False))
     for _, b in blocks.iterrows():
+        t_ = int(b.get("Tier", 0) or 0)
+        tiered = "Tier" in blocks and ((blocks["From (mm)"] == b["From (mm)"]) & (blocks["Tier"] == 1)).any()
         k = b[by]; mid = (b["From (mm)"] + b["To (mm)"]) / 2
         width_mm = b["To (mm)"] - b["From (mm)"]
         tag = f"S{k}" if by == "Stop" else f"{k}"
-        fig.add_annotation(x=mid, y=truck.width + 70, showarrow=False, text=f"<b>{tag}</b>", font=dict(size=11, color=colour(k)))
-        if width_mm > truck.length * 0.07:
-            fig.add_annotation(x=mid, y=truck.width / 2, showarrow=False, bgcolor="rgba(255,255,255,0.85)", borderpad=2,
-                               text=f"<b>{b.Category[:16]}</b><br>{b.Lanes}×{b.Layers} · {b.Rows} rows<br>{b.Cases} cs", font=dict(size=9, color="#222"))
-    _frame(fig, truck.length, truck.width, "Top view - each tile is one stack of cases", "Width (mm)")
+        if t_ == 0:
+            fig.add_annotation(x=mid, y=truck.width + 70, showarrow=False, text=f"<b>{tag}</b>", font=dict(size=11, color=colour(k)))
+        if width_mm > truck.length * 0.07 or t_ == 1:
+            yy = truck.width * (0.75 if t_ == 1 else 0.25) if tiered else truck.width / 2
+            head = "▲ TOP: " if t_ == 1 else ("BASE: " if tiered else "")
+            fig.add_annotation(x=mid, y=yy, showarrow=False, bgcolor="rgba(255,255,255,0.9)", borderpad=2,
+                               text=f"<b>{head}{b.Category[:16]}</b><br>{b.Lanes}×{b.Layers} · {b.Rows} rows<br>{b.Cases} cs", font=dict(size=9, color="#222"))
+    _void(fig, stacks, truck.length, truck.width)
+    _separators(fig, blocks, truck.width)
+    _frame(fig, truck.length, truck.width, "Top view - each tile is one stack of cases (stacks centred across the width)", "Width (mm)")
     return fig
 
 
-def side_view(stacks: pd.DataFrame, truck, by: str = "Line", names: dict | None = None) -> go.Figure:
+def side_view(stacks: pd.DataFrame, truck, by: str = "Line", names: dict | None = None, blocks: pd.DataFrame | None = None) -> go.Figure:
     fig = go.Figure()
     # tallest stack per row position (what you see from the side)
-    side = stacks.sort_values("z").groupby(["x", "Line"], as_index=False).last()
+    stacks = stacks.copy()
+    if "z0" not in stacks:
+        stacks["z0"] = 0.0
+    side = stacks.sort_values("z").groupby(["x", "Line", "z0"], as_index=False).last()
     for line, label, g in _groups(side, by, names):
         xs, ys = [], []
         for _, s in g.iterrows():
             for k in range(int(s.layers)):
-                y0 = k * s.h
+                y0 = s.z0 + k * s.h
                 xs += [s.x, s.x + s.dx, s.x + s.dx, s.x, s.x, None]; ys += [y0, y0, y0 + s.h, y0 + s.h, y0, None]
         fig.add_trace(go.Scatter(x=xs, y=ys, fill="toself", mode="lines", line=dict(color="white", width=1),
                                  fillcolor=colour(line), name=label, hoverinfo="name"))
+    _void(fig, stacks, truck.length, truck.height)
+    _separators(fig, blocks, truck.height)
     _frame(fig, truck.length, truck.height, "Side view - each band is one layer", "Height (mm)")
     return fig
 
@@ -72,7 +113,8 @@ def view_3d(stacks: pd.DataFrame, truck, by: str = "Line", names: dict | None = 
         ex, ey, ez = [], [], []
         for _, s in g.iterrows():
             b = len(X); x0, x1, y0, y1, z1 = s.x, s.x + s.dx, s.y, s.y + s.dy, s.z
-            X += [x0, x1, x1, x0, x0, x1, x1, x0]; Y += [y0, y0, y1, y1, y0, y0, y1, y1]; Z += [0, 0, 0, 0, z1, z1, z1, z1]
+            zb = float(s.get("z0", 0) or 0)
+            X += [x0, x1, x1, x0, x0, x1, x1, x0]; Y += [y0, y0, y1, y1, y0, y0, y1, y1]; Z += [zb, zb, zb, zb, z1, z1, z1, z1]
             for f in faces:
                 I.append(b + f[0]); J.append(b + f[1]); K.append(b + f[2])
             for (a, c) in ((x0, y0), (x1, y0), (x1, y1), (x0, y1), (x0, y0)):

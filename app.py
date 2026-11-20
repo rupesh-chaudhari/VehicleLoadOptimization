@@ -14,7 +14,9 @@ from pathlib import Path
 import pandas as pd
 import streamlit as st
 
-from optimizer import (MODES, usable_truck, plan_trucks, single_category_max, recommend_fleet, top_up_hint, build_lines)
+import optimizer
+from optimizer import (MODES, usable_truck, plan_trucks, single_category_max, recommend_fleet, top_up_hint, build_lines, stability_report,
+                       layer_rounding, apply_adjustments)
 from planogram import top_view, side_view, view_3d, colour
 from loader import loader_html, loading_steps
 
@@ -55,12 +57,14 @@ def read_inputs(data: bytes):
 
 
 @st.cache_data(show_spinner=False)
-def cached_recommend(order, norms, trucks, clear, penalty, by_stop, target):
+def cached_recommend(order, norms, trucks, clear, penalty, by_stop, target, stable, level=0):
+    optimizer.CONFIG["stable"] = stable; optimizer.CONFIG["level_mm"] = level or None
     return recommend_fleet(order, norms, trucks, clear, penalty, by_stop, min_util=target)
 
 
 @st.cache_data(show_spinner=False)
-def cached_plan(order, norms, trow, clear, mode, max_trucks, by_stop):
+def cached_plan(order, norms, trow, clear, mode, max_trucks, by_stop, stable, level=0):
+    optimizer.CONFIG["stable"] = stable; optimizer.CONFIG["level_mm"] = level or None
     return plan_trucks(order, norms, usable_truck(trow, *clear), mode, max_trucks, by_stop)
 
 
@@ -92,10 +96,22 @@ def render_plan(p, key, title, by="Line", target=0.85):
     c[4].metric("Filled by", "Weight" if k["payload_util"] >= k["floor_util"] else "Floor space")
     if k["utilisation"] < target:
         st.info(f"Below the {target:.0%} target. {top_up_hint(p, None)}.")
+    rep = stability_report(p)
+    if rep:
+        s = st.columns(5)
+        s[0].metric("Load height", f"{rep['height_min']:.0f}–{rep['height_max']:.0f} mm", help="Lowest and highest stack across the rows")
+        s[1].metric("Void at doors", f"{rep['void_mm'] / 1000:.2f} m")
+        s[2].metric("Side gap (each side)", f"{rep['side_gap_mm']:.0f} mm")
+        s[3].metric("Floor gaps", rep["floor_gaps"], help="Rows that cannot be filled wall to wall")
+        s[4].metric("Centre of gravity", f"{rep['cg_pct']:.0%} of length", help="35–65% keeps axle loads balanced")
+        if rep["actions"]:
+            st.warning("**Securing the load**\n\n" + "\n".join(f"- {x}" for x in rep["actions"]))
+        else:
+            st.success("Load is level, full width and fills the body - standard securing is enough.")
     v1, v2, v3, v4 = st.tabs(["Planogram", "Loading steps", "3D view", "Order lines"])
     with v1:
         st.plotly_chart(top_view(p["stacks"], p["blocks"], t, by), width="stretch", key=f"top{key}")
-        st.plotly_chart(side_view(p["stacks"], t, by), width="stretch", key=f"side{key}")
+        st.plotly_chart(side_view(p["stacks"], t, by, None, p["blocks"]), width="stretch", key=f"side{key}")
     with v2:
         steps = loading_steps(p["blocks"]).drop(columns="_key")
         st.dataframe(steps, width="stretch", hide_index=True)
@@ -108,6 +124,52 @@ def render_plan(p, key, title, by="Line", target=0.85):
                        "text/html", key=f"ls{key}")
 
 
+def rounding_panel(plans, key):
+    """Decision table: cases to add / remove per block to make every block a full layer (perfectly level)."""
+    st.subheader("Full-layer rounding – decide per line")
+    st.caption("A part layer on top is what makes a block uneven. For each line choose: **Add** the cases to complete the layer, "
+               "**Remove** the part layer, or **Keep** the order as is. Then re-plan. "
+               "'Add fits truck?' checks each line alone against the truck's spare payload.")
+    d = layer_rounding(plans)
+    if d.empty:
+        return
+    todo = d[d["Part-layer cases"] > 0]
+    c = st.columns(4)
+    c[0].metric("Lines already full layers", f"{(d['Part-layer cases'] == 0).sum()} of {len(d)}")
+    c[1].metric("Cases to add (all 'Add')", f"{int(todo['Add for full layer (cases)'].sum()):,}")
+    c[2].metric("Cases to remove (all 'Remove')", f"{int(todo['Remove for full layer (cases)'].sum()):,}")
+    sug = todo["Suggested"]
+    net = int(todo.loc[sug == "Add", "Add for full layer (cases)"].sum() - todo.loc[sug == "Remove", "Remove for full layer (cases)"].sum())
+    c[3].metric("Net change if suggestions taken", f"{net:+,} cases")
+    d.insert(len(d.columns), "Decision", "Keep")
+    ed = st.data_editor(
+        d, hide_index=True, width="stretch", key=f"round{key}",
+        disabled=[c_ for c_ in d.columns if c_ != "Decision"],
+        column_config={"Decision": st.column_config.SelectboxColumn(options=["Keep", "Add", "Remove"], required=True,
+                                                                     help="Your decision for this line"),
+                       "Add for full layer (cases)": st.column_config.NumberColumn(format="+%d"),
+                       "Remove for full layer (cases)": st.column_config.NumberColumn(format="-%d")})
+    b1, b2, b3 = st.columns([1, 1, 2])
+    if b1.button("Use suggestions", key=f"sug{key}"):
+        ed = d.copy(); ed["Decision"] = ed["Suggested"].map(lambda s: s if s in ("Add", "Remove") else "Keep")
+        _apply_decisions(ed); st.rerun()
+    if b2.button("Apply my decisions & re-plan", type="primary", key=f"app{key}"):
+        _apply_decisions(ed); st.rerun()
+    buf = io.BytesIO(); ed.to_excel(buf, index=False)
+    b3.download_button("⬇ Rounding decisions (Excel)", buf.getvalue(), "full_layer_rounding.xlsx", key=f"rdl{key}")
+
+
+def _apply_decisions(ed):
+    adj = dict(st.session_state.get("adj", {}))
+    for _, r in ed.iterrows():
+        k = (str(r["Drop"] or ""), r["Category"])
+        if r["Decision"] == "Add":
+            adj[k] = adj.get(k, 0) + int(r["Add for full layer (cases)"])
+        elif r["Decision"] == "Remove":
+            adj[k] = adj.get(k, 0) - int(r["Remove for full layer (cases)"])
+    st.session_state["adj"] = {k: v for k, v in adj.items() if v}
+
+
 def excel_report(plans, label):
     buf = io.BytesIO()
     with pd.ExcelWriter(buf, engine="openpyxl") as w:
@@ -117,6 +179,7 @@ def excel_report(plans, label):
         for n, p in enumerate(plans):
             loading_steps(p["blocks"]).drop(columns="_key").to_excel(w, sheet_name=f"Truck {n + 1} loading steps", index=False)
             p["table"].to_excel(w, sheet_name=f"Truck {n + 1} lines", index=False)
+        layer_rounding(plans).to_excel(w, sheet_name="Full-layer rounding", index=False)
     return buf.getvalue()
 
 
@@ -135,6 +198,14 @@ with st.sidebar.expander("Loading clearances (mm)"):
     cw = st.number_input("Width", 0, 300, int(setting("Width clearance (mm)", 20)))
     ch = st.number_input("Height", 0, 500, int(setting("Height clearance (mm)", 50)))
 clear = (cl, cw, ch)
+stable = st.sidebar.toggle("Stable loading (transit-safe)", value=True,
+                           help="Full-width rows only (no floor gaps), one orientation per category, ONE level load height for the whole truck, "
+                                "low-norm products tiered on a same-stop base, separators between stops, "
+                                "stacks centred, tallest/heaviest blocks at the cab. Off = maximum cube (may leave gaps that shift in transit).")
+level = st.sidebar.number_input("Level load height (mm, 0 = auto)", 0, 2600, 0, 50, disabled=not stable,
+                                help="Stable mode plans every truck to one common load height so the load is flat from cab to doors. "
+                                     "Auto = case-weighted median of the products' maximum stack heights.")
+optimizer.CONFIG["stable"] = stable; optimizer.CONFIG["level_mm"] = level or None
 target = st.sidebar.slider("Target vehicle utilisation", 0.5, 1.0, float(setting("Target vehicle utilisation (%)", 85)) / 100, 0.05, format="%.2f")
 
 # ================================================================ main
@@ -160,6 +231,18 @@ order = order_box.data_editor(
                    "Order qty (cases)": st.column_config.NumberColumn(min_value=0, step=1),
                    "Priority": st.column_config.NumberColumn(min_value=1, step=1, help="1 = load first (Load a chosen truck → Priority order)"),
                    "Must-load min (cases)": st.column_config.NumberColumn(min_value=0, step=1, help="Optional minimum on the first truck")})
+adj = st.session_state.get("adj", {})
+if adj:
+    order_in = order
+    order = apply_adjustments(order_in, adj)
+    q0 = pd.to_numeric(order_in["Order qty (cases)"], errors="coerce").fillna(0).astype(int)
+    chg = order_in.assign(**{"Change (cases)": order["Order qty (cases)"] - q0, "Planned qty (cases)": order["Order qty (cases)"]})
+    chg = chg[chg["Change (cases)"] != 0][["Drop", "Category", "Order qty (cases)", "Change (cases)", "Planned qty (cases)"]]
+    with order_box.expander(f"Full-layer rounding applied: {int(chg['Change (cases)'].sum()):+,} cases on {len(chg)} lines - planning uses these quantities",
+                            expanded=True):
+        st.dataframe(chg, hide_index=True, width="stretch")
+        if st.button("Reset to original order"):
+            st.session_state["adj"] = {}; st.rerun()
 multi_drop = pd.to_numeric(order["Stop sequence"], errors="coerce").notna().any()
 by_stop = order_box.checkbox("Multi-drop: load by stop sequence (last stop at the cab, first stop at the doors)", value=bool(multi_drop),
                       disabled=not multi_drop, help="Uses the Stop sequence column")
@@ -182,7 +265,7 @@ with tab_rec:
         st.warning("Select at least one vehicle.")
     else:
         with st.spinner("Choosing vehicles and optimising each load..."):
-            rec = cached_recommend(order, norms, pool, clear, penalty, by_stop, target)
+            rec = cached_recommend(order, norms, pool, clear, penalty, by_stop, target, stable, level)
         if not rec.get("ok"):
             st.error(rec.get("message"))
         else:
@@ -221,6 +304,8 @@ with tab_rec:
                 with tb:
                     render_plan(p, f"r{n}", f"Truck {n + 1}", colour_by, target)
             st.download_button("⬇ Download vehicle plan (Excel)", excel_report(plans, "rec"), "vehicle_plan.xlsx", type="primary")
+            st.divider()
+            rounding_panel(plans, "rec")
 
 # ---------------------------------------------------------------- chosen truck
 with tab_one:
@@ -237,7 +322,7 @@ with tab_one:
     t = usable_truck(trow, *clear)
     st.caption(f"**{t.name}** · usable {t.length:,.0f} × {t.width:,.0f} × {t.height:,.0f} mm · payload {t.payload_kg:,.0f} kg")
     with st.spinner("Optimising..."):
-        plans1 = cached_plan(order, norms, trow, clear, mode, 20 if multi else 1, by_stop)
+        plans1 = cached_plan(order, norms, trow, clear, mode, 20 if multi else 1, by_stop, stable, level)
     if not plans1:
         st.warning("Nothing could be loaded. Check the order, must-load minimums and that cases fit this truck.")
     else:
@@ -249,6 +334,8 @@ with tab_one:
             with tb:
                 render_plan(p, f"c{n}", f"Truck {n + 1}", colour_by, target)
         st.download_button("⬇ Download load plan (Excel)", excel_report(plans1, "one"), "load_plan.xlsx")
+        st.divider()
+        rounding_panel(plans1, "one")
 
 # ---------------------------------------------------------------- matrix
 with tab_matrix:
